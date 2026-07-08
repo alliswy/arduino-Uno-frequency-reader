@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# Measurement data (copy from SD card locally — don't commit logs)
+*.BIN
+*.bin
+*.CSV
+*.csv
+
+# Plot exports (optional local output)
+*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
