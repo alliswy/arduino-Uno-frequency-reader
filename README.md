@@ -15,8 +15,8 @@ Portable high-rate vibration data logger for field measurements. An Arduino read
 
 ```
 arduino_logger/
-├── Messkoffer_v0.6/
-│   └── Messkoffer_v0.6.ino   # Arduino firmware (internal version v0.7)
+├── Messkoffer_v0.7/
+│   └── Messkoffer_v0.7.ino   # Arduino firmware v0.7
 ├── read_bin.py               # Read .BIN files, quick plot, data-loss check
 ├── bin_to_csv.py             # Convert .BIN to CSV
 ├── plot_bin.py               # Interactive plotting (single file, folder, or combined)
@@ -64,7 +64,7 @@ Open the Serial Monitor at **115200 baud** and send single-character commands:
 
 ### Compile-time settings
 
-Edit the `#define` values at the top of `Messkoffer_v0.6.ino`:
+Edit the `#define` values at the top of `Messkoffer_v0.7.ino`:
 
 | Setting | Description | Default |
 |---------|-------------|---------|
@@ -123,7 +123,7 @@ Useful options: `--axis`, `--units raw|g|ms2`, `--rate`, `--save plot.png`, `--n
 
 ## Typical workflow
 
-1. Flash `Messkoffer_v0.6.ino` to the Arduino (Arduino IDE or `arduino-cli`).
+1. Flash `Messkoffer_v0.7.ino` to the Arduino (Arduino IDE or `arduino-cli`).
 2. Insert a FAT32 SD card.
 3. Optionally set the RTC (`w`) and a session note (`n`).
 4. Start recording with `s`, or let auto-start handle it.

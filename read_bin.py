@@ -1,4 +1,4 @@
-"""Read Messkoffer v0.6 .BIN vibration logs (text header + binary X,Y,Z)."""
+"""Read Messkoffer v0.7 .BIN vibration logs (text header + binary X,Y,Z)."""
 
 from __future__ import annotations
 
