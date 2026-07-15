@@ -2,6 +2,7 @@
 //  ADXL345 Vibrations-Logger — Vollversion v0.7
 // ================================================================
 //  Hardware: Arduino UNO R4 WiFi (or Mega), ADXL345, DS3231 RTC, SD
+//             Gruene LED = Aufnahme laeuft (blink)   Rote LED = SD-Fehler (blink)
 //
 //  Befehle (Serial Monitor, 115200 Baud):
 //    s = Aufnahme starten       x = Aufnahme stoppen
@@ -19,6 +20,10 @@
 
 // ===================== EINSTELLUNGEN ============================
 #define PIN_SD_CS           10
+
+// Status-LEDs: Anode (+) ueber 220 Ohm an Pin, Kathode (-) an GND
+#define PIN_LED_GREEN       7   // Aufnahme laeuft
+#define PIN_LED_RED         8   // SD-Fehler / Start fehlgeschlagen
 
 // Abtastrate [Hz]: 100 / 200 / 400 / 800 / 1600 / 3200
 #define CFG_RATE            1600
@@ -64,6 +69,13 @@
 
 // Stoppt Aufnahme nach N fehlgeschlagenen SD-Schreibversuchen hintereinander
 #define SD_FAIL_STOP        10
+
+// LED: kurz auf, dann laenger aus
+#define LED_BLINK_ON_MS     100
+#define LED_BLINK_OFF_MS    3000
+
+// SD-Wartezeit zwischen Neustart-Versuchen (Karte entfernt)
+#define SD_RECOVERY_MS      3000
 // ===================== ENDE EINSTELLUNGEN =======================
 
 
@@ -129,6 +141,66 @@ String        startTimeStr   = "";
 
 static const char* MONTHS[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
+
+
+// ================================================================
+//  Status-LEDs (blinkend)
+// ================================================================
+
+enum LedMode { LED_OFF, LED_RECORDING, LED_SD_ERROR };
+
+LedMode       ledMode           = LED_OFF;
+unsigned long lastLedToggleMs   = 0;
+bool          ledOn             = false;
+
+void ledsInit() {
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+}
+
+void setLedMode(LedMode mode) {
+  ledMode = mode;
+  lastLedToggleMs = millis();
+  if (mode == LED_OFF) {
+    ledOn = false;
+    digitalWrite(PIN_LED_GREEN, LOW);
+    digitalWrite(PIN_LED_RED, LOW);
+  } else {
+    ledOn = true;
+    digitalWrite(PIN_LED_GREEN, mode == LED_RECORDING ? HIGH : LOW);
+    digitalWrite(PIN_LED_RED,   mode == LED_SD_ERROR ? HIGH : LOW);
+  }
+}
+
+void updateLedBlink() {
+  if (ledMode == LED_OFF) return;
+  unsigned long now = millis();
+  unsigned long interval = ledOn ? LED_BLINK_ON_MS : LED_BLINK_OFF_MS;
+  if (now - lastLedToggleMs < interval) return;
+  lastLedToggleMs = now;
+  ledOn = !ledOn;
+  digitalWrite(PIN_LED_GREEN, ledOn && ledMode == LED_RECORDING ? HIGH : LOW);
+  digitalWrite(PIN_LED_RED,   ledOn && ledMode == LED_SD_ERROR ? HIGH : LOW);
+}
+
+void waitWithBlink(unsigned long ms) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    updateLedBlink();
+    delay(10);
+  }
+}
+
+void deviceReboot() {
+#if defined(ARDUINO_ARCH_RENESAS)
+  NVIC_SystemReset();
+#else
+  void (*resetFunc)(void) = 0;
+  resetFunc();
+#endif
+}
 
 
 // ================================================================
@@ -345,34 +417,50 @@ bool readFifoToRam() {
 //  SD — Test, Dateien, Schreiben
 // ================================================================
 
-void stopRecording();
+void stopRecording();           // forward decl
+void stopRecordingSdFailure();  // forward decl
+void enterSdRecovery();         // forward decl — never returns until reboot
 
-bool sdCardSelfTest() {
+bool isSdCardDetected() {
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+  SPI.begin();
+  Sd2Card card;
+  return card.init(SPI_HALF_SPEED, PIN_SD_CS);
+}
+
+bool remountSdCard() {
+  SPI.begin();
+  return SD.begin(PIN_SD_CS);
+}
+
+bool sdCardSelfTest(bool verbose = true) {
   pinMode(PIN_SD_CS, OUTPUT);
   digitalWrite(PIN_SD_CS, HIGH);
   SPI.begin();
 
-  Serial.println("\n--- SD-Karten-Test ---");
-
-  Serial.print("  SD.begin: ");
+  if (verbose) Serial.println("\n--- SD-Karten-Test ---");
+  if (verbose) Serial.print("  SD.begin: ");
   if (!SD.begin(PIN_SD_CS)) {
-    Serial.println("FEHLER (Verkabelung / Karte / FAT32?)");
+    if (verbose) Serial.println("FEHLER (Verkabelung / Karte / FAT32?)");
     sdOk = false;
     return false;
   }
-  Serial.println("OK");
+  if (verbose) Serial.println("OK");
 
   File tf = SD.open("SDTEST.TXT", FILE_WRITE);
   if (!tf) {
-    Serial.println("  Schreibtest: FEHLER");
+    if (verbose) Serial.println("  Schreibtest: FEHLER");
     sdOk = false;
     return false;
   }
   tf.println("Messkoffer SD test OK");
   tf.close();
   SD.remove("SDTEST.TXT");
-  Serial.println("  Schreibtest: OK");
-  Serial.println("--- SD bereit ---\n");
+  if (verbose) {
+    Serial.println("  Schreibtest: OK");
+    Serial.println("--- SD bereit ---\n");
+  }
   sdOk = true;
   return true;
 }
@@ -438,10 +526,34 @@ void createFile() {
     Serial.println(sdCreateFailCount);
     return;
   }
-  writeFileHeader();
-  dataFile.flush();
+  if (dataFile.size() == 0) {
+    writeFileHeader();
+    dataFile.flush();
+  }
   Serial.print("Datei: ");
   Serial.println(filename);
+}
+
+bool recoverSdRecording() {
+  Serial.println("  SD remount ...");
+  if (dataFile) {
+    dataFile.flush();
+    dataFile.close();
+  }
+  delay(50);
+  if (!remountSdCard()) {
+    sdOk = false;
+    return false;
+  }
+  sdOk = true;
+  dataFile = SD.open(filename, FILE_WRITE);
+  if (!dataFile) {
+    Serial.println("  Datei reopen: FEHLER");
+    return false;
+  }
+  consecutiveSdWriteFails = 0;
+  Serial.println("  SD wiederhergestellt.");
+  return true;
 }
 
 bool writeBufferToSD() {
@@ -481,22 +593,36 @@ bool writeBufferToSD() {
     sampleCount    += ramIdx;
     totalSamples   += ramIdx;
     consecutiveSdWriteFails = 0;
-  } else {
-    sdWriteFailCount++;
-    samplesLostSD += ramIdx;
-    consecutiveSdWriteFails++;
-    Serial.print(" [SD err #");
-    Serial.print(sdWriteFailCount);
-    Serial.print("]");
-    if (consecutiveSdWriteFails >= SD_FAIL_STOP) {
-      Serial.println(" Too many SD errors - stopping.");
-      stopRecording();
+    ramIdx = 0;
+    lastWriteMs = millis();
+    return true;
+  }
+
+  sdWriteFailCount++;
+  consecutiveSdWriteFails++;
+  Serial.print(" [SD err #");
+  Serial.print(sdWriteFailCount);
+  Serial.print(" — ");
+  Serial.print(ramIdx);
+  Serial.println(" Samples im Puffer (werden wiederholt)]");
+
+  if (consecutiveSdWriteFails >= SD_FAIL_STOP) {
+    Serial.println("  Zu viele SD-Fehler — pruefe Karte ...");
+    if (!isSdCardDetected()) {
+      samplesLostSD += ramIdx;
+      Serial.println("  SD-Karte nicht erkannt — Recovery-Modus.");
+      stopRecordingSdFailure();
+    } else if (recoverSdRecording()) {
+      Serial.println("  Remount OK — Schreibversuch wiederholen.");
+      return writeBufferToSD();
+    } else {
+      samplesLostSD += ramIdx;
+      Serial.println("  SD nicht wiederherstellbar — Recovery-Modus.");
+      stopRecordingSdFailure();
     }
   }
 
-  ramIdx = 0;
-  lastWriteMs = millis();
-  return ok;
+  return false;
 }
 
 // Flush nur wenn Sensor-FIFO Luft hat — schuetzt vor OVF und Stromausfall
@@ -524,15 +650,65 @@ void closeFile() {
   dataFile.close();
 }
 
+void closeFileBestEffort() {
+  if (!dataFile) return;
+  if (ramIdx > 0) {
+#if CFG_BINARY
+    size_t bytes = (size_t)ramIdx * 3 * sizeof(int16_t);
+    dataFile.write((const uint8_t*)ramBuf, bytes);
+#else
+    for (int i = 0; i < ramIdx; i++) {
+      int p = i * 3;
+      dataFile.print(ramBuf[p]);     dataFile.print(',');
+      dataFile.print(ramBuf[p + 1]); dataFile.print(',');
+      dataFile.println(ramBuf[p + 2]);
+    }
+#endif
+    ramIdx = 0;
+  }
+  dataFile.flush();
+  dataFile.close();
+}
+
 
 // ================================================================
 //  Aufnahme
 // ================================================================
 
+void enterSdRecovery() {
+  isRecording = false;
+  sdOk = false;
+  closeFileBestEffort();
+  setLedMode(LED_SD_ERROR);
+  Serial.println("\n!!! SD FEHLER — warte auf Karte (rote LED blinkt) ...");
+
+  while (true) {
+    waitWithBlink(SD_RECOVERY_MS);
+    Serial.println("SD-Check ...");
+    if (sdCardSelfTest(false)) {
+      Serial.println("SD OK — Neustart, Aufnahme folgt.");
+      waitWithBlink(500);
+      deviceReboot();
+    }
+    Serial.println("SD noch nicht OK — Neustart ...");
+    deviceReboot();
+  }
+}
+
+void stopRecordingSdFailure() {
+  if (isRecording) {
+    isRecording = false;
+    closeFileBestEffort();
+    Serial.println("\n=== AUFNAHME BEENDET (SD FEHLER) ===");
+  }
+  enterSdRecovery();
+}
+
 void startRecording() {
   if (isRecording) return;
   if (!sdOk) {
-    Serial.println("SD nicht bereit! Befehl 'c' zum Testen.");
+    Serial.println("SD nicht bereit!");
+    enterSdRecovery();
     return;
   }
 
@@ -557,9 +733,20 @@ void startRecording() {
   lastProgressMs = lastFlushMs = lastWriteMs = millis();
 
   createFile();
+  if (!dataFile && remountSdCard()) {
+    sdOk = true;
+    createFile();
+  }
   if (dataFile) {
     isRecording = true;
+    setLedMode(LED_RECORDING);
     Serial.println("Aufnahme laeuft...");
+  } else if (!isSdCardDetected()) {
+    Serial.println("FEHLER: SD-Karte nicht erkannt.");
+    enterSdRecovery();
+  } else {
+    Serial.println("FEHLER: Aufnahme konnte nicht gestartet werden (Datei).");
+    enterSdRecovery();
   }
 }
 
@@ -585,15 +772,31 @@ void rotateFile() {
   createFile();
   if (!dataFile) {
     sdCreateFailCount++;
-    Serial.print("FEHLER: Neue Datei! Stoppe. #");
+    Serial.print("FEHLER: Neue Datei! #");
     Serial.println(sdCreateFailCount);
     isRecording = false;
+    if (!isSdCardDetected()) {
+      stopRecordingSdFailure();
+    } else if (remountSdCard()) {
+      sdOk = true;
+      createFile();
+      if (dataFile) {
+        isRecording = true;
+        setLedMode(LED_RECORDING);
+        Serial.println("Rotation wiederhergestellt.");
+      } else {
+        stopRecordingSdFailure();
+      }
+    } else {
+      stopRecordingSdFailure();
+    }
   }
 }
 
 void stopRecording() {
   if (!isRecording) return;
   isRecording = false;
+  setLedMode(LED_OFF);
   closeFile();
 
   unsigned long dur = millis() - recStartMs;
@@ -751,6 +954,7 @@ void readSessionNoteFromSerial() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
+  ledsInit();
 
   Serial.println("\n=============================================");
   Serial.println("  ADXL345 Vibrations-Logger — v0.7");
@@ -795,20 +999,28 @@ void setup() {
 
   if (CFG_SD_CHECK_BOOT) {
     if (!sdCardSelfTest()) {
-      Serial.println("SD FEHLER! Befehl 'c' zum Wiederholen. Kein Auto-Start.");
+      enterSdRecovery();
     }
   } else {
     SPI.begin();
     sdOk = SD.begin(PIN_SD_CS);
-    Serial.print("SD-Karte: ");
-    Serial.println(sdOk ? "OK" : "FEHLER!");
+    if (!sdOk) {
+      Serial.println("SD-Karte: FEHLER!");
+      enterSdRecovery();
+    } else {
+      Serial.println("SD-Karte: OK");
+    }
   }
 
   Serial.print("ADXL345: ");
   adxlReset();
   if (!adxlInit()) {
     Serial.println("FEHLER!");
-    while (1) delay(1000);
+    setLedMode(LED_SD_ERROR);
+    while (true) {
+      updateLedBlink();
+      delay(10);
+    }
   }
   Serial.print("OK (");
   Serial.print(CFG_RATE);
@@ -818,22 +1030,26 @@ void setup() {
   Serial.println("BEFEHLE: s=Start x=Stop c=SD-Test i=Info t=Test n=Session z=Zeit r=RTC w=RTC manuell\n");
 
 #if CFG_AUTOSTART
-  if (sdOk) {
-    startRecording();
-  } else {
-    Serial.println("Auto-Start ausgelassen (SD nicht OK).");
-  }
+  startRecording();
 #endif
 }
 
 void loop() {
+  updateLedBlink();
+
   // Nur bei USB-Serial — verhindert Zufallsbytes am Powerbank (x stoppt sonst)
   if (Serial && Serial.available()) {
     char c = Serial.read();
     switch (c) {
       case 's': case 'S': startRecording(); break;
       case 'x': case 'X': stopRecording();  break;
-      case 'c': case 'C': sdCardSelfTest();   break;
+      case 'c': case 'C':
+        if (isRecording) {
+          Serial.println("SD-Test waehrend Aufnahme deaktiviert.");
+          break;
+        }
+        sdCardSelfTest();
+        break;
       case 'i': case 'I': showInfo();         break;
       case 'n': case 'N': readSessionNoteFromSerial(); break;
       case 'z': case 'Z':
